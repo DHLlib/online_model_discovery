@@ -1,0 +1,1 @@
+{ "meta": { "title": "Online model discovery", "description": "Fetches pi-ai provider models from the live endpoint first, falls back to bundled metadata on failure, and briefly shows an orange notice." } }

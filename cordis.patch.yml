@@ -1,0 +1,3 @@
+- insert:
+    - id: online-model-discovery
+      name: '@local/online-model-discovery'
