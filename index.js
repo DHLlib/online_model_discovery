@@ -9,7 +9,7 @@
  */
 
 export const name = 'online-model-discovery'
-export const inject = ['webServer', 'llm']
+export const inject = ['webServer', 'llm', 'connection']
 
 const TARGET_NS = 'llm-pi-ai'
 const TARGET_PKG = '@deepseek-ai/dsh-llm-pi-ai'
@@ -310,6 +310,21 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
+/**
+ * Apply DSH Connection's Host/Origin and browser-authentication checks to a
+ * plain `webServer` route. `webServer.register` routes are outside the shared
+ * connection handler, so without this any page open in the browser could call
+ * them through loopback.
+ */
+function rejectUntrusted(ctx, req, res) {
+  const connection = ctx.get('connection')
+  if (connection === undefined || typeof connection.requestRejection !== 'function') return false
+  const rejection = connection.requestRejection({ headers: req.headers })
+  if (rejection === undefined) return false
+  json(res, rejection, { ok: false, message: rejection === 401 ? 'unauthorized' : 'forbidden' })
+  return true
+}
+
 async function readJsonBody(req) {
   const chunks = []
   let size = 0
@@ -424,6 +439,7 @@ export function apply(ctx) {
       kind: 'exact',
       path: PROBE_ROUTE,
       async handler(req, res) {
+        if (rejectUntrusted(ctx, req, res)) return
         const url = new URL(req.url ?? PROBE_ROUTE, 'http://localhost')
         const provider = url.searchParams.get('provider') ?? 'kimi-coding'
         try {
@@ -438,6 +454,7 @@ export function apply(ctx) {
       kind: 'exact',
       path: STATUS_ROUTE,
       async handler(req, res) {
+        if (rejectUntrusted(ctx, req, res)) return
         const url = new URL(req.url ?? STATUS_ROUTE, 'http://localhost')
         if (url.searchParams.get('ui') === '1') uiLastHitAt = Date.now()
         if (url.searchParams.has('injected')) {
@@ -456,7 +473,8 @@ export function apply(ctx) {
     const disposeProviders = ctx.webServer.register({
       kind: 'exact',
       path: PROVIDERS_ROUTE,
-      async handler(_req, res) {
+      async handler(req, res) {
+        if (rejectUntrusted(ctx, req, res)) return
         try {
           const providers = ctx.llm.listConfigurableProviders().map((entry) => ({
             provider: entry.provider,
@@ -494,6 +512,7 @@ export function apply(ctx) {
       kind: 'exact',
       path: REASONING_ROUTE,
       async handler(req, res) {
+        if (rejectUntrusted(ctx, req, res)) return
         const url = new URL(req.url ?? REASONING_ROUTE, 'http://localhost')
         const provider = url.searchParams.get('provider')
         if (typeof provider !== 'string' || provider.length === 0) {
