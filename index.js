@@ -6,7 +6,14 @@
  * never show up. This plugin wraps that call: ask the provider endpoint first,
  * fall back to the original catalog answer on failure, and expose the last
  * fallback so the page can show a friendly notice.
+ *
+ * It also wraps `settings.mutate(...)`: a hand-declared model inherits the
+ * pi-ai catalog's wire-compatibility switches only when the catalog knows its
+ * id, so the plugin carries the provider-wide ones over. See `stampCompat`.
  */
+
+import { readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const name = 'online-model-discovery'
 export const inject = ['webServer', 'llm', 'connection']
@@ -27,6 +34,9 @@ const cache = new Map()
 const detections = new Map()
 const fallbacks = []
 const lastSuccessAt = new Map()
+const catalogs = new Map()
+let catalogRoot
+let lastCompatFailure = null
 let uiLastHitAt = 0
 let uiInjected = -1
 
@@ -63,54 +73,266 @@ function isTargetSettingsNamespace(ns) {
   return ns === TARGET_NS || ns === `include:${TARGET_NS}` || String(ns).endsWith(`:${TARGET_NS}`)
 }
 
-/** The adopt flow does not carry reasoningEfforts; preserve existing declarations. */
-function preserveReasoningEfforts(ctx, ns, ops) {
-  if (!isTargetSettingsNamespace(ns) || !Array.isArray(ops)) return ops
-  return ops.map((op) => {
-    if (op?.op !== 'set' || !Array.isArray(op.path) || op.path.length !== 3) return op
-    if (op.path[0] !== 'providers' || op.path[2] !== 'models' || !Array.isArray(op.value)) return op
-    const provider = op.path[1]
-    const configured = providerConfig(ctx, provider).models
-    const previous = new Map(
-      (Array.isArray(configured) ? configured : [])
-        .filter((model) => typeof model?.id === 'string')
-        .map((model) => [model.id, model]),
-    )
-    const detected = detections.get(provider)?.models
-    let changed = false
-    const models = op.value.map((model) => {
-      if (!isPlain(model) || typeof model.id !== 'string') return model
-      const info = detected?.get(model.id)
-      const next = { ...model }
-      let touched = false
-      if (next.reasoningEfforts === undefined) {
-        const efforts = previous.get(model.id)?.reasoningEfforts ?? info?.efforts
-        if (efforts !== undefined) {
-          next.reasoningEfforts = efforts
-          touched = true
-        }
+/**
+ * The compat switches a profile may set, per wire protocol.
+ *
+ * `dsh-llm-pi-ai` refuses every name outside this list — a field pi-ai's
+ * installed catalog sets for a named vendor is withheld from configuration —
+ * so the plugin only ever writes these. Mirrors the `offer` dispositions of its
+ * `COMPAT_GATES`; a DSH upgrade that narrows one is caught by the retry in the
+ * `settings.mutate` wrapper instead of failing the user's save.
+ */
+const RESPONSES_COMPAT = [
+  'supportsDeveloperRole',
+  'supportsMaxOutputTokens',
+  'supportsStrictMode',
+  'supportsLongCacheRetention',
+]
+const OFFERED_COMPAT = new Map([
+  [
+    'openai-completions',
+    new Set([
+      'supportsStore',
+      'supportsDeveloperRole',
+      'supportsReasoningEffort',
+      'supportsUsageInStreaming',
+      'supportsFinishReason',
+      'maxTokensField',
+      'requiresToolResultName',
+      'requiresAssistantAfterToolResult',
+      'requiresThinkingAsText',
+      'requiresReasoningContentOnAssistantMessages',
+      'thinkingFormat',
+      'chatTemplateKwargs',
+      'chatTemplateArgs',
+      'supportsThinkingTokenBudget',
+      'thinkingTokenBudgetField',
+      'vllmPriority',
+      'supportsStrictMode',
+      'cacheControlFormat',
+      'supportsLongCacheRetention',
+    ]),
+  ],
+  ['openai-responses', new Set(RESPONSES_COMPAT)],
+  ['azure-openai-responses', new Set(RESPONSES_COMPAT)],
+  ['openai-codex-responses', new Set(RESPONSES_COMPAT)],
+  [
+    'anthropic-messages',
+    new Set([
+      'supportsEagerToolInputStreaming',
+      'supportsLongCacheRetention',
+      'supportsCacheControlOnTools',
+      'supportsTemperature',
+      'forceAdaptiveThinking',
+      'allowEmptySignature',
+      'supportsStrictTools',
+    ]),
+  ],
+  ['bedrock-converse-stream', new Set(['supportsStrictMode'])],
+])
+
+/**
+ * Where pi-ai keeps its per-provider catalog data. The override exists for
+ * tests and for a profile whose install directory the environment does not
+ * name; without one the plugin simply leaves compat alone.
+ */
+function catalogDirectory() {
+  if (catalogRoot !== undefined) return catalogRoot
+  catalogRoot = null
+  const candidates = []
+  const explicit = process.env.ONLINE_MODEL_DISCOVERY_CATALOG_DIR
+  if (typeof explicit === 'string' && explicit.length > 0) candidates.push(explicit)
+  const install = process.env.DSH_INSTALL_DIR
+  if (typeof install === 'string' && install.length > 0) {
+    candidates.push(join(install, '..', '..', '@earendil-works', 'pi-ai', 'dist', 'providers', 'data'))
+  }
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isDirectory()) {
+        catalogRoot = candidate
+        break
       }
-      if (next.contextWindow === undefined && info?.contextWindow !== undefined) {
-        next.contextWindow = info.contextWindow
-        touched = true
+    } catch {
+      // Missing candidate: try the next one.
+    }
+  }
+  return catalogRoot
+}
+
+/**
+ * One provider's installed catalog, grouped by wire protocol.
+ *
+ * `dsh-llm-pi-ai` merges this catalog under the configured models by id, so a
+ * model id pi-ai ships already inherits everything here. The plugin reads it for
+ * the ids it does *not* ship: those are the ones that fall through to pi-ai's
+ * baseURL detection.
+ */
+function catalogFor(provider) {
+  if (catalogs.has(provider)) return catalogs.get(provider)
+  let entry
+  const directory = catalogDirectory()
+  if (directory !== null && /^[\w.-]+$/.test(provider)) {
+    try {
+      const raw = JSON.parse(readFileSync(join(directory, `${provider}.json`), 'utf8'))
+      const byApi = new Map()
+      for (const [api, models] of Object.entries(raw)) {
+        if (!OFFERED_COMPAT.has(api) || !isPlain(models)) continue
+        const list = Object.values(models).filter(isPlain)
+        if (list.length > 0) byApi.set(api, list)
       }
-      if (next.maxTokens === undefined && info?.maxTokens !== undefined) {
-        next.maxTokens = info.maxTokens
-        touched = true
+      const apis = [...byApi.keys()]
+      if (apis.length > 0) entry = { byApi, api: apis.length === 1 ? apis[0] : undefined }
+    } catch {
+      // No catalog for this provider, or a pi-ai layout this build cannot read.
+    }
+  }
+  catalogs.set(provider, entry)
+  return entry
+}
+
+function sameValue(left, right) {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) && Array.isArray(right)) return JSON.stringify(left) === JSON.stringify(right)
+  if (isPlain(left) && isPlain(right)) return JSON.stringify(left) === JSON.stringify(right)
+  return false
+}
+
+/** The switches every model on one protocol declares the same way. */
+function consensusCompat(models, offered) {
+  const agreed = {}
+  for (const field of offered) {
+    let value
+    let unanimous = true
+    for (const model of models) {
+      const compat = isPlain(model.compat) ? model.compat : {}
+      if (!Object.hasOwn(compat, field)) {
+        unanimous = false
+        break
       }
-      if (
-        (next.input === undefined || (Array.isArray(next.input) && next.input.length === 0)) &&
-        info?.inputModalities !== undefined
-      ) {
-        next.input = info.inputModalities
-        touched = true
+      if (value === undefined) value = compat[field]
+      else if (!sameValue(value, compat[field])) {
+        unanimous = false
+        break
       }
-      if (!touched) return model
-      changed = true
-      return next
-    })
-    return changed ? { ...op, value: models } : op
+    }
+    if (unanimous && value !== undefined) agreed[field] = value
+  }
+  return agreed
+}
+
+/**
+ * Give hand-declared models the switches their provider's catalog agrees on.
+ *
+ * pi-ai detects compat from the provider id and baseURL, and for an endpoint it
+ * does not recognize it answers as though it were OpenAI itself — which is how
+ * a hand-declared Kimi model ended up sending the system prompt as the
+ * `developer` role and drawing a 400. What every model of that provider's wire
+ * protocol declares stays true for an unknown model of the same endpoint, so it
+ * is safe to carry over; anything the catalog's own models disagree about is a
+ * model-family choice and is left to pi-ai.
+ *
+ * A route-level switch already wins for every model, so it is not repeated on
+ * the entries; a switch the entry already states is the user's and is kept.
+ */
+function stampCompat(ctx, provider, models, routeOverride) {
+  const catalog = catalogFor(provider)
+  if (catalog === undefined) return models
+  const route = routeOverride ?? providerConfig(ctx, provider)
+  const api = typeof route.api === 'string' && route.api.length > 0 ? route.api : catalog.api
+  if (api === undefined) return models
+  const offered = OFFERED_COMPAT.get(api)
+  const group = catalog.byApi.get(api)
+  if (offered === undefined || group === undefined) return models
+  const known = new Set(group.map((model) => model.id))
+  const agreed = consensusCompat(group, offered)
+  const routeCompat = isPlain(route.compat) ? route.compat : {}
+  const fields = Object.keys(agreed).filter((field) => !Object.hasOwn(routeCompat, field))
+  if (fields.length === 0) return models
+  let changed = false
+  const next = models.map((model) => {
+    if (!isPlain(model) || typeof model.id !== 'string' || known.has(model.id)) return model
+    const current = isPlain(model.compat) ? model.compat : {}
+    const patch = {}
+    for (const field of fields) {
+      if (!Object.hasOwn(current, field)) patch[field] = agreed[field]
+    }
+    if (Object.keys(patch).length === 0) return model
+    changed = true
+    return { ...model, compat: { ...current, ...patch } }
   })
+  return changed ? next : models
+}
+
+/** The adopt flow does not carry metadata; fill it from detection and catalog. */
+function enrichModels(ctx, provider, value, route) {
+  const configured = providerConfig(ctx, provider).models
+  const previous = new Map(
+    (Array.isArray(configured) ? configured : [])
+      .filter((model) => typeof model?.id === 'string')
+      .map((model) => [model.id, model]),
+  )
+  const detected = detections.get(provider)?.models
+  const enriched = value.map((model) => {
+    if (!isPlain(model) || typeof model.id !== 'string') return model
+    const info = detected?.get(model.id)
+    const next = { ...model }
+    let touched = false
+    if (next.reasoningEfforts === undefined) {
+      const efforts = previous.get(model.id)?.reasoningEfforts ?? info?.efforts
+      if (efforts !== undefined) {
+        next.reasoningEfforts = efforts
+        touched = true
+      }
+    }
+    if (next.contextWindow === undefined && info?.contextWindow !== undefined) {
+      next.contextWindow = info.contextWindow
+      touched = true
+    }
+    if (next.maxTokens === undefined && info?.maxTokens !== undefined) {
+      next.maxTokens = info.maxTokens
+      touched = true
+    }
+    if (
+      (next.input === undefined || (Array.isArray(next.input) && next.input.length === 0)) &&
+      info?.inputModalities !== undefined
+    ) {
+      next.input = info.inputModalities
+      touched = true
+    }
+    if (!touched) return model
+    return next
+  })
+  const models = enriched.some((model, index) => model !== value[index]) ? enriched : value
+  return stampCompat(ctx, provider, models, route)
+}
+
+/**
+ * Enrich every write that replaces a provider's model list: both the models
+ * write the Models page sends after a discovery and the whole-profile write the
+ * provider card commits.
+ */
+function enrichModelWrites(ctx, ns, ops) {
+  if (!isTargetSettingsNamespace(ns) || !Array.isArray(ops)) return ops
+  let changed = false
+  const next = ops.map((op) => {
+    if (op?.op !== 'set' || !Array.isArray(op.path) || op.path[0] !== 'providers') return op
+    const provider = op.path[1]
+    if (typeof provider !== 'string' || provider.length === 0) return op
+    if (op.path.length === 3 && op.path[2] === 'models' && Array.isArray(op.value)) {
+      const models = enrichModels(ctx, provider, op.value)
+      if (models === op.value) return op
+      changed = true
+      return { ...op, value: models }
+    }
+    if (op.path.length === 2 && isPlain(op.value) && Array.isArray(op.value.models)) {
+      const models = enrichModels(ctx, provider, op.value.models, op.value)
+      if (models === op.value.models) return op
+      changed = true
+      return { ...op, value: { ...op.value, models } }
+    }
+    return op
+  })
+  return changed ? next : ops
 }
 
 function defaultBaseURL(ctx, provider) {
@@ -427,8 +649,21 @@ export function apply(ctx) {
   const settings = ctx.get('settings')
   const originalMutate = settings?.mutate
   if (settings !== undefined && typeof originalMutate === 'function') {
-    settings.mutate = async (ns, ops, expectedRevision) =>
-      originalMutate.call(settings, ns, preserveReasoningEfforts(ctx, ns, ops), expectedRevision)
+    settings.mutate = async (ns, ops, expectedRevision) => {
+      const enriched = enrichModelWrites(ctx, ns, ops)
+      if (enriched === ops) return originalMutate.call(settings, ns, ops, expectedRevision)
+      try {
+        return await originalMutate.call(settings, ns, enriched, expectedRevision)
+      } catch (error) {
+        // A switch this DSH build refuses must never cost the caller its write:
+        // retry with the ops it sent, and remember why for diagnostics.
+        lastCompatFailure = {
+          at: Date.now(),
+          message: error instanceof Error ? error.message : String(error),
+        }
+        return originalMutate.call(settings, ns, ops, expectedRevision)
+      }
+    }
     ctx.effect(() => () => {
       settings.mutate = originalMutate
     })
@@ -495,6 +730,11 @@ export function apply(ctx) {
           json(res, 200, {
             ok: true,
             providers,
+            catalog: {
+              readable: catalogDirectory() !== null,
+              covered: providers.filter((entry) => catalogFor(entry.provider) !== undefined).length,
+              lastCompatFailure,
+            },
             client: {
               graphRev: graph?.rev,
               release: graph?.release,

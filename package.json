@@ -1,9 +1,10 @@
 {
   "name": "@local/online-model-discovery",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
-  "description": "Online-first model discovery and per-model reasoning-effort editing for pi-ai providers.",
+  "description": "Online-first model discovery, per-model reasoning-effort editing, and catalog-derived compat for pi-ai providers.",
+  "scripts": { "test": "node test/catalog-compat.test.mjs" },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
