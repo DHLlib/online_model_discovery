@@ -12,7 +12,8 @@
  * id, so the plugin carries the provider-wide ones over. See `stampCompat`.
  */
 
-import { readFileSync, statSync } from 'node:fs'
+import { appendFileSync, readFileSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 export const name = 'online-model-discovery'
@@ -38,6 +39,17 @@ const catalogs = new Map()
 let catalogRoot
 let lastCompatFailure = null
 let settingsService
+
+const DIAG_FILE = join(tmpdir(), 'online-model-discovery-diag.jsonl')
+
+/** Append one diagnostic record; never throw, never block the host. */
+function diag(stage, data = {}) {
+  try {
+    appendFileSync(DIAG_FILE, `${JSON.stringify({ at: new Date().toISOString(), stage, ...data })}\n`)
+  } catch {
+    // Diagnostics are best-effort.
+  }
+}
 let uiLastHitAt = 0
 let uiInjected = -1
 
@@ -343,8 +355,13 @@ function enrichModelWrites(ctx, ns, ops) {
  * are undone when the plugin is disposed, so a reload never leaves a wrapper
  * chained on the shared service.
  */
-function attachSettingsHook(ctx, scope, settings) {
-  if (settings === undefined) return
+function attachSettingsHook(ctx, scope, settings, via) {
+  diag('attach', {
+    via,
+    hasSettings: settings !== undefined,
+    hasMutate: typeof settings?.mutate === 'function',
+  })
+  if (settings === undefined || settingsService === settings) return
   settingsService = settings
   const originalMutate = settings.mutate
   if (typeof originalMutate !== 'function') return
@@ -385,34 +402,56 @@ function attachSettingsHook(ctx, scope, settings) {
  * catalog into it. Best-effort — a failed migration must never keep the host
  * from starting.
  */
+/** The provider config declarations of this profile, or `undefined` while the
+ * config tree has not been described yet. */
+function configuredProviders(ctx) {
+  const row = targetRow(ctx)
+  if (row === undefined) return undefined
+  const effective = deepMerge(row.inherited ?? {}, row.override ?? {})
+  return isPlain(effective?.providers) ? effective.providers : {}
+}
+
 async function backfillModels(ctx, settings, attempt = 0) {
-  let row
-  try {
-    row = (settings.describe?.() ?? []).find((candidate) => String(candidate?.ns ?? '').endsWith(TARGET_NS))
-  } catch {
-    row = undefined
-  }
-  if (row === undefined) {
-    if (attempt < 5) {
-      setTimeout(() => {
-        void backfillModels(ctx, settings, attempt + 1)
-      }, 400)
-    }
-    return
-  }
-  const providers = isPlain(row.user?.providers) ? row.user.providers : {}
-  for (const [provider, profile] of Object.entries(providers)) {
-    if (!isPlain(profile) || !Array.isArray(profile.models) || profile.models.length === 0) continue
+  const providers = configuredProviders(ctx)
+  const entries = Object.entries(providers ?? {}).filter(
+    ([, profile]) => isPlain(profile) && Array.isArray(profile.models) && profile.models.length > 0,
+  )
+  diag('backfill', {
+    attempt,
+    described: providers !== undefined,
+    providers: Object.keys(providers ?? {}),
+    entries: entries.map(([provider]) => provider),
+  })
+  let wrote = 0
+  const ns = settingsNamespace(settings)
+  for (const [provider, profile] of entries) {
     try {
       const models = enrichModels(ctx, provider, profile.models, profile)
+      diag('backfill-provider', {
+        provider,
+        models: profile.models.length,
+        changed: models !== profile.models,
+        catalog: catalogDirectory(),
+      })
       if (models === profile.models) continue
-      await settings.mutate(row.ns, [{ op: 'set', path: ['providers', provider, 'models'], value: models }])
+      await settings.mutate(ns, [{ op: 'set', path: ['providers', provider, 'models'], value: models }])
+      wrote += 1
+      diag('backfill-write', { provider, ok: true })
     } catch (error) {
-      lastCompatFailure = {
-        at: Date.now(),
-        message: error instanceof Error ? error.message : String(error),
-      }
+      const message = error instanceof Error ? error.message : String(error)
+      diag('backfill-write', { provider, ok: false, message })
+      lastCompatFailure = { at: Date.now(), message }
     }
+  }
+  // The config tree may still be settling when the service mounts: keep looking
+  // for a while, then give up quietly so a profile with no configured models
+  // does not poll forever.
+  const waiting = providers === undefined || (entries.length === 0 && attempt < 10)
+  if (wrote === 0 && waiting && attempt < 40) {
+    const timer = setTimeout(() => {
+      void backfillModels(ctx, settings, attempt + 1)
+    }, 1_500)
+    timer.unref?.()
   }
 }
 
@@ -661,6 +700,12 @@ function reasoningRows(ctx, provider) {
 }
 
 export function apply(ctx) {
+  diag('apply', {
+    inject: typeof ctx.inject,
+    hasSettings: ctx.get('settings') !== undefined,
+    hasConfigEditor: ctx.get('configEditor') !== undefined,
+    installDir: process.env.DSH_INSTALL_DIR ?? null,
+  })
   const llm = ctx.llm
   const original = llm.discoverModels.bind(llm)
 
@@ -733,10 +778,41 @@ export function apply(ctx) {
   // way for the service it configures. A context without `inject` keeps the old
   // direct read so the plugin still loads.
   if (typeof ctx.inject === 'function') {
-    ctx.inject(['settings'], (child) => attachSettingsHook(ctx, child, child.settings))
+    ctx.inject(['settings'], (child) => {
+      diag('inject-fired')
+      attachSettingsHook(ctx, child, child.settings, 'inject')
+    })
   } else {
-    attachSettingsHook(ctx, ctx, ctx.get('settings'))
+    attachSettingsHook(ctx, ctx, ctx.get('settings'), 'direct')
   }
+
+  // `inject` is the supported wait, but if this context never fires it the hook
+  // must still install: poll the service for a minute as a fallback.
+  ctx.effect(() => {
+    let attempts = 0
+    let stopped = false
+    const look = () => {
+      if (stopped || settingsService !== undefined) return
+      const settings = ctx.get('settings')
+      if (settings !== undefined) {
+        attachSettingsHook(ctx, ctx, settings, 'poll')
+        return
+      }
+      attempts += 1
+      if (attempts < 60) {
+        const next = setTimeout(look, 1_000)
+        next.unref?.()
+      } else {
+        diag('poll-exhausted', { attempts })
+      }
+    }
+    const timer = setTimeout(look, 1_000)
+    timer.unref?.()
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+  })
 
   ctx.effect(() => {
     const disposeProbe = ctx.webServer.register({
