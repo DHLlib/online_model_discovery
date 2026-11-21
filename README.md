@@ -74,8 +74,9 @@ Kimi Coding 的推荐档位：
 - 端点的 `/models` 不返回推理档位时（例如 Kimi Code），需要在弹窗中手动配置；
 - 不同端点的元数据字段不统一，插件只采用显式字段，未识别时保留 pi-ai 目录值；
 - `compat` 只能补“同提供商同协议型号一致”的开关；按型号族区分的开关（如 `thinkingFormat`、`requiresReasoningContentOnAssistantMessages`）在目录里本就不一致时不会被猜出来，需要时可在 provider 或型号上手写；
-- 读取目录依赖 DSH 安装目录（`DSH_INSTALL_DIR`）；读不到时不补 `compat`，其余功能不受影响，也可用 `ONLINE_MODEL_DISCOVERY_CATALOG_DIR` 指定目录；
-- 启动回填只写用户层里已经存在的模型列表，且只在缺少开关时写一次（追加幂等，重启不会重复改写）；
+- 读取目录依赖 DSH 安装目录：默认从宿主进程的 `process.resourcesPath` / `process.execPath` 推导，也可用 `ONLINE_MODEL_DISCOVERY_CATALOG_DIR` 指定目录；读不到时不补 `compat`，其余功能不受影响；
+- 启动回填只写已有模型列表，且只在缺少开关时写一次（追加幂等，重启不会重复改写）；
+- 自诊断默认关闭，需要排查时设 `ONLINE_MODEL_DISCOVERY_DIAG=1` 后日志写到 `%TEMP%/online-model-discovery-diag.jsonl`（apply / attach / backfill / write 各阶段）；
 - 不修改 DSH 本体，不依赖私有 API；DSH 升级后如 slot 或 provider 字段变化，可能需要同步适配。
 
 ## 开发

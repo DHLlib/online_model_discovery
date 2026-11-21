@@ -42,8 +42,14 @@ let settingsService
 
 const DIAG_FILE = join(tmpdir(), 'online-model-discovery-diag.jsonl')
 
-/** Append one diagnostic record; never throw, never block the host. */
+/**
+ * Optional self-diagnostics: which stage ran, whether settings was reachable,
+ * which providers were enriched, and what a write answered. Off unless
+ * `ONLINE_MODEL_DISCOVERY_DIAG=1` is set on the host environment — this plugin
+ * must not write to a log file on every save otherwise.
+ */
 function diag(stage, data = {}) {
+  if (process.env.ONLINE_MODEL_DISCOVERY_DIAG !== '1') return
   try {
     appendFileSync(DIAG_FILE, `${JSON.stringify({ at: new Date().toISOString(), stage, ...data })}\n`)
   } catch {
@@ -820,8 +826,6 @@ export function apply(ctx) {
       if (attempts < 60) {
         const next = setTimeout(look, 1_000)
         next.unref?.()
-      } else {
-        diag('poll-exhausted', { attempts })
       }
     }
     const timer = setTimeout(look, 1_000)
