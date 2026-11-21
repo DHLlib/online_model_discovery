@@ -14,7 +14,7 @@
 
 import { appendFileSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 
 export const name = 'online-model-discovery'
 export const inject = ['webServer', 'llm', 'connection']
@@ -145,21 +145,38 @@ const OFFERED_COMPAT = new Map([
 ])
 
 /**
- * Where pi-ai keeps its per-provider catalog data. The override exists for
- * tests and for a profile whose install directory the environment does not
- * name; without one the plugin simply leaves compat alone.
+ * Where pi-ai keeps its per-provider catalog data.
+ *
+ * The host process does not receive `DSH_INSTALL_DIR` (that variable is set for
+ * tool subprocesses), so the install has to be found from the runtime itself:
+ * an Electron host knows `process.resourcesPath`, and `process.execPath` covers
+ * the same layout when `resourcesPath` is absent. The env override exists for
+ * tests and unusual layouts.
  */
-function catalogDirectory() {
-  if (catalogRoot !== undefined) return catalogRoot
-  catalogRoot = null
+function catalogCandidates() {
   const candidates = []
   const explicit = process.env.ONLINE_MODEL_DISCOVERY_CATALOG_DIR
   if (typeof explicit === 'string' && explicit.length > 0) candidates.push(explicit)
+  const resources = process.resourcesPath
+  if (typeof resources === 'string' && resources.length > 0) {
+    candidates.push(join(resources, 'app.asar', 'dsh', 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers', 'data'))
+    candidates.push(join(resources, 'app', 'dsh', 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers', 'data'))
+  }
   const install = process.env.DSH_INSTALL_DIR
   if (typeof install === 'string' && install.length > 0) {
     candidates.push(join(install, '..', '..', '@earendil-works', 'pi-ai', 'dist', 'providers', 'data'))
   }
-  for (const candidate of candidates) {
+  const executable = process.execPath
+  if (typeof executable === 'string' && executable.length > 0) {
+    candidates.push(join(dirname(executable), 'resources', 'app.asar', 'dsh', 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'providers', 'data'))
+  }
+  return candidates
+}
+
+function catalogDirectory() {
+  if (catalogRoot !== undefined) return catalogRoot
+  catalogRoot = null
+  for (const candidate of catalogCandidates()) {
     try {
       if (statSync(candidate).isDirectory()) {
         catalogRoot = candidate
@@ -169,6 +186,7 @@ function catalogDirectory() {
       // Missing candidate: try the next one.
     }
   }
+  diag('catalog-dir', { dir: catalogRoot, resources: process.resourcesPath ?? null })
   return catalogRoot
 }
 
