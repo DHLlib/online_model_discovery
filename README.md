@@ -48,7 +48,7 @@ dsh plugin --profile web add github:DHLlib/online_model_discovery
 3. 在弹窗中为每个模型打开开关，编辑 `档位 / API 参数值`，点击保存；
 4. 模型列表为空时按钮置灰，需先点 **获取可用模型** 并保存模型列表。
 
-> 已有模型列表不会自动补 `compat`：升级插件后重新保存一次模型列表即可，之后每次保存都会自动补齐。
+> 插件启动时会自动回填已有模型列表里缺失的 `compat`，通常重启 DSH 即可；若宿主无法写配置，重新保存一次模型列表也会补齐。
 
 Kimi Coding 的推荐档位：
 
@@ -61,7 +61,8 @@ Kimi Coding 的推荐档位：
 ## 工作方式
 
 - 宿主侧 `index.js` 包装 `llm.discoverModels` 与 `llm.resolveModelInfo`，并暴露本地只读/写入路由；
-- 宿主侧同时包装 `settings.mutate`：写入 `providers.<p>.models` 或整块 provider 时补齐元数据与 `compat`；
+- 宿主侧通过 `ctx.inject(['settings'], …)` 等 settings 服务就绪后包装 `settings.mutate`：写入 `providers.<p>.models` 或整块 provider 时补齐元数据与 `compat`（直接 `ctx.get('settings')` 在插件 apply 时还拿不到服务，钩子会静默失效）；
+- 服务就绪后还会做一次启动回填，把已有模型列表里缺失的 `compat` 写回用户层，避免"升级插件后第一发请求仍然 400"；
 - `compat` 从 **pi-ai 自带目录**（`dist/providers/data/<provider>.json`）推导，不是插件里的厂商表：取该提供商、该协议下所有型号声明一致的开关，只写 `dsh-llm-pi-ai` 允许配置的字段；路由级 `compat` 已声明的字段不再重复写到型号上；
 - 写入被 DSH 校验拒绝时（例如 DSH 升级收紧了可配置字段），自动退回原始写入，保存不会失败，失败原因可通过 `/online-model-discovery/providers` 的 `catalog.lastCompatFailure` 查看；
 - 客户端 `client.js` 只使用官方 `settings.models.provider-card` slot，不做 DOM 注入；
@@ -74,7 +75,7 @@ Kimi Coding 的推荐档位：
 - 不同端点的元数据字段不统一，插件只采用显式字段，未识别时保留 pi-ai 目录值；
 - `compat` 只能补“同提供商同协议型号一致”的开关；按型号族区分的开关（如 `thinkingFormat`、`requiresReasoningContentOnAssistantMessages`）在目录里本就不一致时不会被猜出来，需要时可在 provider 或型号上手写；
 - 读取目录依赖 DSH 安装目录（`DSH_INSTALL_DIR`）；读不到时不补 `compat`，其余功能不受影响，也可用 `ONLINE_MODEL_DISCOVERY_CATALOG_DIR` 指定目录；
-- 已保存的模型列表不会自动回填，需在 **设置 → 模型** 重新保存一次；
+- 启动回填只写用户层里已经存在的模型列表，且只在缺少开关时写一次（追加幂等，重启不会重复改写）；
 - 不修改 DSH 本体，不依赖私有 API；DSH 升级后如 slot 或 provider 字段变化，可能需要同步适配。
 
 ## 开发

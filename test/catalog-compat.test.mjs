@@ -33,9 +33,10 @@ process.env.ONLINE_MODEL_DISCOVERY_CATALOG_DIR = catalogDir
 
 const { apply } = await import('../index.js')
 
-function makeCtx({ providers = {}, failFirst = false } = {}) {
+function makeCtx({ providers = {}, failFirst = false, userProviders = {}, legacy = false } = {}) {
   const calls = []
   const settings = {
+    describe: () => [{ ns: 'llm-pi-ai', revision: 0, user: { providers: userProviders } }],
     mutate: async (ns, ops) => {
       calls.push({ ns, ops })
       if (failFirst && calls.length === 1) throw new Error('compat "bogus" is not configurable')
@@ -58,8 +59,13 @@ function makeCtx({ providers = {}, failFirst = false } = {}) {
     effect(fn) {
       fn()
     },
+    inject(deps, callback) {
+      assert.deepEqual(deps, ['settings'])
+      callback({ settings, effect: (fn) => fn(), get: (name) => ctx.get(name) })
+    },
     webServer: { register: () => () => {} },
   }
+  if (legacy) delete ctx.inject
   apply(ctx)
   return { settings, calls }
 }
@@ -116,4 +122,22 @@ test('a refused switch costs the save nothing', async () => {
   assert.deepEqual(await settings.mutate('llm-pi-ai', ops), { kind: 'written' })
   assert.equal(calls.length, 2)
   assert.equal(calls[1].ops, ops)
+})
+
+test('a list saved before this version is backfilled on start', async () => {
+  const models = [{ id: 'k3.1-pro', name: 'K3.1 Pro' }]
+  const { calls } = makeCtx({
+    providers: { 'kimi-coding': { models } },
+    userProviders: { 'kimi-coding': { models } },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].ops[0].path, ['providers', 'kimi-coding', 'models'])
+  assert.equal(calls[0].ops[0].value[0].compat.supportsDeveloperRole, false)
+})
+
+test('a context without inject still gets the write hook', async () => {
+  const { settings, calls } = makeCtx({ legacy: true })
+  await settings.mutate('llm-pi-ai', modelsWrite('kimi-coding', [{ id: 'k3.1-pro', name: 'K3.1 Pro' }]))
+  assert.equal(calls[0].ops[0].value[0].compat.supportsDeveloperRole, false)
 })

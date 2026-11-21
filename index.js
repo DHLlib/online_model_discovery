@@ -37,6 +37,7 @@ const lastSuccessAt = new Map()
 const catalogs = new Map()
 let catalogRoot
 let lastCompatFailure = null
+let settingsService
 let uiLastHitAt = 0
 let uiInjected = -1
 
@@ -333,6 +334,86 @@ function enrichModelWrites(ctx, ns, ops) {
     return op
   })
   return changed ? next : ops
+}
+
+/**
+ * Install the write hook and the one-shot backfill on the settings service.
+ *
+ * `scope` supplies the lifecycle (`ctx`, or an injected child context): both
+ * are undone when the plugin is disposed, so a reload never leaves a wrapper
+ * chained on the shared service.
+ */
+function attachSettingsHook(ctx, scope, settings) {
+  if (settings === undefined) return
+  settingsService = settings
+  const originalMutate = settings.mutate
+  if (typeof originalMutate !== 'function') return
+  settings.mutate = async (ns, ops, expectedRevision) => {
+    const enriched = enrichModelWrites(ctx, ns, ops)
+    if (enriched === ops) return originalMutate.call(settings, ns, ops, expectedRevision)
+    try {
+      return await originalMutate.call(settings, ns, enriched, expectedRevision)
+    } catch (error) {
+      // A switch this DSH build refuses must never cost the caller its write:
+      // retry with the ops it sent, and remember why for diagnostics.
+      lastCompatFailure = {
+        at: Date.now(),
+        message: error instanceof Error ? error.message : String(error),
+      }
+      return originalMutate.call(settings, ns, ops, expectedRevision)
+    }
+  }
+  scope.effect(() => () => {
+    settings.mutate = originalMutate
+    if (settingsService === settings) settingsService = undefined
+  })
+  // Lists saved before this version carry no compat, and waiting for the user
+  // to open the Models page again would leave the first request broken.
+  scope.effect(() => {
+    const timer = setTimeout(() => {
+      void backfillModels(ctx, settings)
+    }, 0)
+    return () => clearTimeout(timer)
+  })
+}
+
+/**
+ * Backfill the model lists saved before this version carried compat.
+ *
+ * Reads the user layer only: a list the user never wrote has nothing to
+ * enrich, and writing inherited values back into the profile would freeze the
+ * catalog into it. Best-effort — a failed migration must never keep the host
+ * from starting.
+ */
+async function backfillModels(ctx, settings, attempt = 0) {
+  let row
+  try {
+    row = (settings.describe?.() ?? []).find((candidate) => String(candidate?.ns ?? '').endsWith(TARGET_NS))
+  } catch {
+    row = undefined
+  }
+  if (row === undefined) {
+    if (attempt < 5) {
+      setTimeout(() => {
+        void backfillModels(ctx, settings, attempt + 1)
+      }, 400)
+    }
+    return
+  }
+  const providers = isPlain(row.user?.providers) ? row.user.providers : {}
+  for (const [provider, profile] of Object.entries(providers)) {
+    if (!isPlain(profile) || !Array.isArray(profile.models) || profile.models.length === 0) continue
+    try {
+      const models = enrichModels(ctx, provider, profile.models, profile)
+      if (models === profile.models) continue
+      await settings.mutate(row.ns, [{ op: 'set', path: ['providers', provider, 'models'], value: models }])
+    } catch (error) {
+      lastCompatFailure = {
+        at: Date.now(),
+        message: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
 }
 
 function defaultBaseURL(ctx, provider) {
@@ -646,27 +727,15 @@ export function apply(ctx) {
     llm.resolveModelInfo = originalResolveModelInfo
   })
 
-  const settings = ctx.get('settings')
-  const originalMutate = settings?.mutate
-  if (settings !== undefined && typeof originalMutate === 'function') {
-    settings.mutate = async (ns, ops, expectedRevision) => {
-      const enriched = enrichModelWrites(ctx, ns, ops)
-      if (enriched === ops) return originalMutate.call(settings, ns, ops, expectedRevision)
-      try {
-        return await originalMutate.call(settings, ns, enriched, expectedRevision)
-      } catch (error) {
-        // A switch this DSH build refuses must never cost the caller its write:
-        // retry with the ops it sent, and remember why for diagnostics.
-        lastCompatFailure = {
-          at: Date.now(),
-          message: error instanceof Error ? error.message : String(error),
-        }
-        return originalMutate.call(settings, ns, ops, expectedRevision)
-      }
-    }
-    ctx.effect(() => () => {
-      settings.mutate = originalMutate
-    })
+  // `settings` is mounted after this plugin applies, so wait for it instead of
+  // reading the service once: `ctx.get('settings')` here would be undefined and
+  // the write hook would silently never install. `dsh-llm-pi-ai` waits the same
+  // way for the service it configures. A context without `inject` keeps the old
+  // direct read so the plugin still loads.
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['settings'], (child) => attachSettingsHook(ctx, child, child.settings))
+  } else {
+    attachSettingsHook(ctx, ctx, ctx.get('settings'))
   }
 
   ctx.effect(() => {
@@ -770,7 +839,7 @@ export function apply(ctx) {
         try {
           const body = await readJsonBody(req)
           const updates = isPlain(body?.updates) ? body.updates : {}
-          const settings = ctx.get('settings')
+          const settings = settingsService ?? ctx.get('settings')
           if (settings === undefined) throw new Error('settings service is unavailable')
           const current = providerConfig(ctx, provider).models
           if (!Array.isArray(current)) throw new Error(`provider "${provider}" has no configured models`)
